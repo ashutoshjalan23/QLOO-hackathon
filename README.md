@@ -1,4 +1,4 @@
-# RainCheck
+# RainCheck × Qloo
 
 RainCheck turns a group conversation into a finished plan. It understands what
 people want, finds options that fit, coordinates the decision, handles the
@@ -7,6 +7,11 @@ phone call, and sends the result back to everyone.
 It is built for the small tasks that quietly consume an entire group chat:
 choosing somewhere to eat, arranging an appointment, contacting a business,
 checking availability, and remembering what was agreed.
+
+The Qloo integration adds recommendations from aggregate cuisine and vibe
+signals, followed by Hong Kong audience ranking with cuisine filters. See
+[Qloo setup, request contracts, and limitations](README_QLOO.md). OSM supplies
+the callable venue data; Qloo and Exa are optional discovery layers.
 
 ## The product flow
 
@@ -64,8 +69,8 @@ Telegram group
   Gemini + fallbacks    SQLite private requirements
           │
           ▼
-  places.py
-  Overpass / OpenStreetMap / Exa
+  places.py + qloo_search.py
+  Overpass / OpenStreetMap / Exa / Qloo
           │
           ▼
   selected plan + human approval
@@ -91,14 +96,27 @@ RainCheck requires Python 3.10 or newer. Clone the repository and create a
 local environment file:
 
 ```bash
-git clone https://github.com/AikagraGupta/convene-gl-hacks.git
-cd convene-gl-hacks
+git clone --branch QLOO https://github.com/ashutoshjalan23/QLOO-hackathon.git
+cd QLOO-hackathon
 cp .env.example .env
 ```
 
 Fill in the credentials in `.env`. At minimum, configure the Telegram bot and
 Gemini. The Telegram bot must be able to read group messages; disable BotFather
 privacy mode for the bot.
+
+For Qloo recommendations, install Node.js 22.19.0 or newer and configure the
+tested harness version:
+
+```bash
+npm install --global @qloo/qloo-harness@0.1.26
+qloo setup --qloo
+qloo setup --status --json
+```
+
+The harness can use its saved credential or `QLOO_API_KEY` from the server
+environment. Missing credentials leave OSM/Exa discovery available. Python
+uses only the standard library and requires no pip install.
 
 Start the two local services in separate terminals:
 
@@ -153,6 +171,7 @@ template.
 | Group coordination | Telegram Bot API and native polls |
 | Conversation understanding | Gemini with OpenRouter fallback |
 | Restaurant and place discovery | Overpass, OpenStreetMap, and Exa |
+| Aggregate taste recommendations and audience ranking | Qloo CLI harness 0.1.26 |
 | Private requirements | SQLite |
 | Voice calls | ElevenLabs Agents or Vapi with Twilio |
 | Local services | Python standard library and the bridge on port 8080 |
@@ -167,6 +186,17 @@ python tests/run.py
 The suite covers conversation extraction, place ranking, cuisine matching,
 private requirements, negotiations, Telegram commands, voice outcomes,
 transcripts, calendar links, and bridge contracts.
+
+Qloo subprocesses are mocked in the suite. Tests cover authentication paths,
+request fields, response failures, Chinese venue names, phone provenance, and
+ranking before truncation. Passing tests do not establish live venue coverage
+or successful real calls; configure credentials and run preflight before a demo.
+
+## Project history
+
+RainCheck builds on an earlier group booking agent. The Qloo adapter and bot
+integration were added in the QLOO branch. See [history and scope](docs/history.md)
+for the inherited features and the preserved September review.
 
 ## License
 

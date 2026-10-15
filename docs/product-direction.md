@@ -2,6 +2,13 @@
 
 Prepared 19 September 2026 from the supplied archive. This is a proposal and code review, not a claim that the proposed features are implemented.
 
+Historical review: this document describes an earlier event and repository.
+Its September dates and handoff details are preserved, not current setup
+instructions. See [history and scope](history.md) for the later commit-date
+rewrite and [the current README](../README.md) for supported behavior. The
+baseline cited below as `1d5c730` is now
+[`0f31315`](https://github.com/ashutoshjalan23/QLOO-hackathon/commit/0f31315).
+
 ## The product to build
 
 **RainCheck takes responsibility for getting a group plan across the finish line.**

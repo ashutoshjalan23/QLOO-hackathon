@@ -1,460 +1,239 @@
 #!/usr/bin/env python3
-"""qloo_search.py — taste-intelligence candidate discovery via the Qloo harness.
+"""Optional Qloo discovery/ranking through @qloo/qloo-harness 0.1.26.
 
-Qloo knows that fans of certain cuisines overlap with certain audiences. That is
-a genuinely different signal from "restaurant is near the district someone named"
-(OSM) or "a web page exists for this place" (Exa). It surfaces candidates that
-fit the group's cultural taste profile, not just their geography.
-
-Two rules that mirror exa_search.py:
-
-1. THIS IS AN ENHANCEMENT, NEVER A DEPENDENCY. Every failure path returns [].
-   No key, no harness installed, dead network, malformed JSON: []. The
-   candidate list must survive this module being completely absent.
-
-2. IT NEVER CLAIMS A PHONE NUMBER. Qloo finds names; OSM makes them callable.
-   Results are merged on normalised name and the phone field is populated only
-   from OSM data.
-
-Integration method: `qloo exec <workflow>` is a local CLI command provided by
-the @qloo/qloo-harness npm package. We call it as a subprocess so that:
-  - no Python pip dependency is needed (standard library only on our side)
-  - the Qloo API key lives inside the harness's private config or QLOO_API_KEY
-    env var, never in our .env or source code
-  - the exact same fallback pattern as Exa applies: any subprocess error -> []
-
-Credential: set via `qloo setup --qloo` (harness stores it privately) OR via
-the QLOO_API_KEY environment variable on the server. Never commit a key.
+Send only aggregate cuisine/vibe concepts and public venue names. The harness
+resolves concepts to real tags; never invent IDs. Qloo supplies no phone numbers.
+Unavailable/ambiguous workflows fall back to OSM/Exa. Credentials may be saved
+by qloo setup or inherited through QLOO_API_KEY.
 """
-
 from __future__ import annotations
 
 import json
 import os
-import re
+import shutil
 import subprocess
-import sys
+import unicodedata
 from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT))
 
 from envlite import env
 
-# Timeout for a single qloo exec call. Keep it short: /decide is watched
-# by six impatient people and this is an enhancement, not the critical path.
 TIMEOUT = 12
 
-# Maximum candidates to request from each Qloo workflow.
-# Qloo recommends up to 20 results; we keep it lower by default to stay
-# well inside the free tier and to keep latency low.
-RECOMMEND_LIMIT = int(env("QLOO_RECOMMEND_LIMIT") or 15)
-RANK_LIMIT = int(env("QLOO_RANK_LIMIT") or 10)
+
+def _limit(value, default=10, maximum=20) -> int:
+    try:
+        return max(1, min(maximum, int(value)))
+    except (TypeError, ValueError):
+        return default
 
 
-# ---------------------------------------------------------------------------
-# Harness availability
-# ---------------------------------------------------------------------------
+RECOMMEND_LIMIT = 15
+RANK_LIMIT = 10
+
+
+def _command(*args: str) -> list[str]:
+    executable = shutil.which("qloo") or "qloo"
+    # npm's Windows shim points here. Run Node directly, avoiding a shell.
+    if os.name == "nt" and executable.lower().endswith((".cmd", ".bat")):
+        entry = Path(executable).parent / "node_modules/@qloo/qloo-harness/dist/bin.js"
+        if not entry.is_file():
+            raise FileNotFoundError("Qloo npm entry point is missing; reinstall the harness")
+        return [shutil.which("node") or "node", str(entry), *args]
+    return [executable, *args]
+
 
 def harness_available() -> bool:
-    """True when `qloo` is on PATH and returns a usable version string."""
     try:
-        result = subprocess.run(
-            ["qloo", "--version"],
-            capture_output=True, text=True, timeout=5,
-        )
+        result = subprocess.run(_command("--version"), capture_output=True,
+                                text=True, encoding="utf-8", timeout=5)
         return result.returncode == 0 and bool(result.stdout.strip())
-    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
         return False
 
 
-# ---------------------------------------------------------------------------
-# Low-level harness call
-# ---------------------------------------------------------------------------
+def readiness() -> bool:
+    """Read saved/env credential readiness without a Qloo API request."""
+    try:
+        result = subprocess.run(_command("setup", "--status", "--json"),
+                                capture_output=True, text=True, encoding="utf-8", timeout=5)
+        report = json.loads(result.stdout)
+        return result.returncode == 0 and report.get("qloo", {}).get("ready") is True
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
+        return False
+
 
 def _exec(workflow: str, payload: dict) -> list | dict:
-    """Call `qloo exec <workflow>` with JSON payload on stdin.
-
-    Returns the parsed JSON result (list or dict), or [] on any failure.
-    The QLOO_API_KEY env var is forwarded to the subprocess so that server
-    deployments can inject the credential without touching the harness config.
-    """
-    key = env("QLOO_API_KEY")
-    if not key:
-        print("[qloo] no QLOO_API_KEY — skipping Qloo (this is fine)")
-        return []
-
-    inp = json.dumps(payload)
-    cmd = ["qloo", "exec", workflow]
-    extra_env = {**os.environ, "QLOO_API_KEY": key}
-
+    """Pipe JSON; let the harness read its saved or env credential."""
     try:
         result = subprocess.run(
-            cmd,
-            input=inp,
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT,
-            env=extra_env,
+            _command("exec", workflow), input=json.dumps(payload),
+            capture_output=True, text=True, encoding="utf-8", timeout=TIMEOUT,
+            env=os.environ.copy(),
         )
-    except FileNotFoundError:
-        print("[qloo] harness not installed (npm install --global @qloo/qloo-harness)")
+        if result.returncode != 0:
+            # stdout/stderr may contain credentials or data; do not echo them.
+            print(f"[qloo] {workflow} failed (exit {result.returncode}); using fallback")
+            return []
+        parsed = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError, UnicodeError):
+        print(f"[qloo] {workflow} unavailable; using fallback")
         return []
-    except subprocess.TimeoutExpired:
-        print(f"[qloo] {workflow} timed out after {TIMEOUT}s")
+    if not isinstance(parsed, (list, dict)):
         return []
-    except OSError as exc:
-        print(f"[qloo] {workflow} subprocess error: {exc}")
+    if isinstance(parsed, dict) and (parsed.get("error") or
+            parsed.get("status", "ok") not in ("ok", "partial")):
+        print(f"[qloo] {workflow} returned no usable result; using fallback")
         return []
-
-    if result.returncode != 0:
-        stderr = (result.stderr or "").strip()[:200]
-        print(f"[qloo] {workflow} exit {result.returncode}: {stderr or '(no stderr)'}")
-        return []
-
-    stdout = (result.stdout or "").strip()
-    if not stdout:
-        print(f"[qloo] {workflow} returned empty output")
-        return []
-
-    try:
-        parsed = json.loads(stdout)
-        return parsed
-    except json.JSONDecodeError as exc:
-        print(f"[qloo] {workflow} invalid JSON: {exc}")
-        return []
+    return parsed
 
 
-# ---------------------------------------------------------------------------
-# Workflow wrappers
-# ---------------------------------------------------------------------------
+def _items(result, *keys) -> list:
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        if result.get("error") or result.get("status", "ok") not in ("ok", "partial"):
+            return []
+        for key in ("results", *keys):
+            if isinstance(result.get(key), list):
+                return result[key]
+    return []
 
-def find_tags(concept: str, limit: int = 5) -> list[str]:
-    """Resolve a free-text concept to Qloo tag IDs.
 
-    Example: "cosy and lively" -> ["ambience:lively", "crowd:social"]
-
-    Returns [] if the harness is unavailable or returns nothing useful.
-    The caller is not expected to handle errors.
-    """
+def find_tags(concept: str, limit: int = 5) -> list[dict]:
+    """Return tag candidates for inspection, rather than auto-selecting a match."""
     if not concept or not concept.strip():
         return []
-
-    result = _exec("find_tags", {"concept": concept.strip(), "limit": limit})
-
-    tags: list[str] = []
-    if isinstance(result, list):
-        for item in result:
-            tag = _extract_tag_id(item)
-            if tag and tag not in tags:
-                tags.append(tag)
-    elif isinstance(result, dict):
-        for item in result.get("tags") or result.get("results") or []:
-            tag = _extract_tag_id(item)
-            if tag and tag not in tags:
-                tags.append(tag)
-
-    if tags:
-        print(f"[qloo] find_tags({concept!r:.40}) -> {tags}")
-    return tags
+    result = _exec("find_tags", {"query": concept.strip(), "limit": _limit(limit, 5)})
+    return [item for item in _items(result) if isinstance(item, dict) and item.get("id")]
 
 
-def _extract_tag_id(item) -> str:
-    """Pull a tag identifier out of whatever shape the harness returns."""
+def _concepts(values) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    return list(dict.fromkeys(value.strip()[:120] for value in values
+                             if isinstance(value, str) and value.strip()))[:10]
+
+
+def _taste_tags(constraints: dict) -> list[str]:
+    soft = constraints.get("soft") or []
+    phrases = [item.get("constraint") for item in soft if isinstance(item, dict)]
+    return _concepts(_concepts(constraints.get("prefer_cuisines")) + _concepts(phrases))
+
+
+def recommend(constraints: dict, limit: int | None = None) -> list[dict]:
+    tags = _taste_tags(constraints)
+    if not tags:
+        return []
+    # Read limits after bot.main has loaded .env, rather than at import time.
+    requested = env("QLOO_RECOMMEND_LIMIT") if limit is None else limit
+    payload = {"target_type": "place", "signal_tags": tags,
+               "filter_location": "Hong Kong", "limit": _limit(requested, RECOMMEND_LIMIT)}
+    cuisines = _concepts(constraints.get("prefer_cuisines"))
+    excluded = _concepts(constraints.get("avoid_cuisines"))
+    if cuisines:
+        payload["include_tags"] = cuisines
+    if excluded:
+        payload["exclude_tags"] = excluded
+    return _rows_from_result(_exec("recommend", payload), "qloo_recommend")
+
+
+def rank(candidates: list[dict], constraints: dict, limit: int | None = None) -> list[dict]:
+    """Rank up to ten options by HK audience affinity with cuisine filters.
+
+    Rank does not accept taste-tag signals. Cuisine concepts are include/exclude
+    filters; Hong Kong is the aggregate audience signal. Preserve every candidate,
+    including duplicate names at different branches.
+    """
+    if not candidates or not _taste_tags(constraints):
+        return candidates
+    options = list(dict.fromkeys(c.get("name") for c in candidates if c.get("name")))
+    requested = env("QLOO_RANK_LIMIT") if limit is None else limit
+    options = options[:_limit(requested, RANK_LIMIT, 10)]
+    if not options:
+        return candidates
+    payload = {"options": options, "option_type": "place", "signal_location": "Hong Kong"}
+    cuisines = _concepts(constraints.get("prefer_cuisines"))
+    excluded = _concepts(constraints.get("avoid_cuisines"))
+    if cuisines:
+        payload["include_tags"] = cuisines
+    if excluded:
+        payload["exclude_tags"] = excluded
+    ordered = _items(_exec("rank", payload))
+    if not ordered:
+        return candidates
+    selected = set(options)
+    used: set[int] = set()
+    reordered = []
+    for item in ordered:
+        name = _name_from_item(item)
+        entity_id = item.get("entity_id") if isinstance(item, dict) else None
+        for index, candidate in enumerate(candidates):
+            if index in used or candidate.get("name") not in selected:
+                continue
+            same_id = entity_id and entity_id == candidate.get("qloo_entity_id")
+            if same_id or (name and _norm(name) == _norm(candidate.get("name", ""))):
+                reordered.append(candidate)
+                used.add(index)
+    return reordered + [c for index, c in enumerate(candidates) if index not in used]
+
+
+def where_popular(entity: str, within: str = "Hong Kong", limit: int = 10) -> list[dict]:
+    """Exploratory heatmap helper, outside the bot's meeting-point selection.
+
+    Return heatmap cells intact, not invented district names. The input must be
+    a public entity name/UUID rather than an invented cuisine entity.
+    """
+    if not entity or not within:
+        return []
+    result = _exec("where_popular", {"entity": entity, "within": within, "limit": _limit(limit)})
+    return [item for item in _items(result) if isinstance(item, dict)]
+
+
+def _name_from_item(item) -> str:
     if isinstance(item, str):
-        return item.strip()
+        return item.strip()[:200]
     if isinstance(item, dict):
-        return str(
-            item.get("id") or item.get("tag_id") or item.get("name") or ""
-        ).strip()
+        name = item.get("name") or item.get("restaurant_name")
+        return name.strip()[:200] if isinstance(name, str) else ""
     return ""
 
 
-def recommend(constraints: dict, limit: int = RECOMMEND_LIMIT) -> list[dict]:
-    """Discover candidate restaurants from Qloo taste signals.
-
-    Builds a structured request from the group's cuisine preferences, vibe
-    words (soft constraints), and geographic scope, then calls qloo_recommend.
-
-    Returns a list of dicts with at least {"name": str}. Phone is always None —
-    phone numbers come from OSM, never from Qloo.
-    """
-    signals = _signals_from_constraints(constraints)
-    tags = _tags_from_constraints(constraints)
-
-    if not signals and not tags:
-        # Nothing to search on. Don't call the API for no reason.
-        return []
-
-    payload = {
-        "target_type": "restaurant",
-        "signals": signals,
-        "tags": tags,
-        "filters": {"location": "Hong Kong"},
-        "limit": limit,
-    }
-    result = _exec("recommend", payload)
-    rows = _rows_from_result(result, source="qloo_recommend")
-    if rows:
-        print(f"[qloo] recommend -> {len(rows)} names")
-    return rows
-
-
-def rank(candidates: list[dict], constraints: dict, limit: int = RANK_LIMIT) -> list[dict]:
-    """Re-rank an existing candidate list by Qloo taste affinity.
-
-    Sends the candidate names to qloo_rank with the group's taste signals.
-    Returns the candidates in the Qloo-preferred order (names re-joined to
-    the original dicts so phone numbers from OSM are preserved), or the
-    original list if Qloo is unavailable.
-
-    The original list is ALWAYS the fallback — this function never discards
-    candidates, it only reorders them.
-    """
-    if not candidates:
-        return []
-
-    signals = _signals_from_constraints(constraints)
-    tags = _tags_from_constraints(constraints)
-
-    if not signals and not tags:
-        return candidates  # nothing to rank on; keep existing order
-
-    names = [c.get("name", "") for c in candidates if c.get("name")]
-    if not names:
-        return candidates
-
-    payload = {
-        "options": names[:40],  # Qloo accepts up to ~40 options per call
-        "option_type": "restaurant",
-        "signals": signals,
-        "tags": tags,
-        "limit": limit,
-    }
-    result = _exec("rank", payload)
-    ordered_names = _names_from_rank_result(result)
-    if not ordered_names:
-        return candidates  # fallback: keep existing order
-
-    # Re-join Qloo's preferred order with the original dicts.
-    # Candidates Qloo didn't mention appear at the end in their original order.
-    by_norm = {_norm(c.get("name", "")): c for c in candidates}
-    reordered: list[dict] = []
-    seen: set[str] = set()
-
-    for name in ordered_names:
-        key = _norm(name)
-        if not key or key in seen:
-            continue
-        match = by_norm.get(key) or next(
-            (v for k, v in by_norm.items() if len(key) > 3 and (key in k or k in key)), None
-        )
-        if match:
-            reordered.append(match)
-            seen.add(_norm(match.get("name", "")))
-
-    for c in candidates:
-        if _norm(c.get("name", "")) not in seen:
-            reordered.append(c)
-
-    print(f"[qloo] rank reordered {len(reordered)} candidates")
-    return reordered
-
-
-def where_popular(entity: str, districts: list[str]) -> list[str]:
-    """Find which districts a given entity type is most popular in.
-
-    Used to upgrade a geometric fair-meeting-point to "fair AND culturally
-    relevant". Returns districts in popularity order, or the original list
-    if Qloo is unavailable.
-
-    `entity` is a descriptive string like "hotpot restaurant".
-    `districts` is the shortlist from places.meeting_districts().
-    """
-    if not entity or not districts:
-        return districts
-
-    payload = {
-        "entity": entity,
-        "within": "Hong Kong",
-        "filters": {"districts": districts},
-    }
-    result = _exec("where_popular", payload)
-    ordered = _districts_from_result(result)
-    if not ordered:
-        return districts  # fallback
-
-    # Keep only districts that were in the original list, in Qloo order.
-    original_set = {d.lower() for d in districts}
-    filtered = [d for d in ordered if d.lower() in original_set]
-    # Append any original districts that Qloo didn't mention, at the end.
-    mentioned = {d.lower() for d in filtered}
-    remainder = [d for d in districts if d.lower() not in mentioned]
-    combined = filtered + remainder
-
-    print(f"[qloo] where_popular({entity!r}) -> {combined}")
-    return combined
-
-
-# ---------------------------------------------------------------------------
-# Constraint → Qloo signal helpers
-# ---------------------------------------------------------------------------
-
-def _signals_from_constraints(constraints: dict) -> list[str]:
-    """Turn prefer_cuisines into Qloo signal strings."""
-    signals: list[str] = []
-    for cuisine in (constraints.get("prefer_cuisines") or []):
-        c = str(cuisine or "").strip().lower()
-        if c:
-            signals.append(f"cuisine:{c}")
-    return signals[:5]  # Qloo recommends a small, focused set
-
-
-def _tags_from_constraints(constraints: dict) -> list[str]:
-    """Resolve soft preferences to Qloo tag IDs (one find_tags call max)."""
-    soft_items = constraints.get("soft") or []
-    if not soft_items:
-        return []
-
-    # Concatenate soft preferences into a single concept query.
-    phrases = [str(item.get("constraint") or "") for item in soft_items if item.get("constraint")]
-    if not phrases:
-        return []
-    concept = ", ".join(phrases[:3])  # limit to 3 soft prefs for a focused query
-    return find_tags(concept, limit=5)
-
-
-# ---------------------------------------------------------------------------
-# Result parsers (tolerant of whatever the harness actually returns)
-# ---------------------------------------------------------------------------
-
 def _rows_from_result(result, source: str) -> list[dict]:
-    """Extract name-only rows from a qloo_recommend response."""
-    items: list = []
-    if isinstance(result, list):
-        items = result
-    elif isinstance(result, dict):
-        items = result.get("results") or result.get("recommendations") or []
-
-    rows: list[dict] = []
-    seen: set[str] = set()
-    for item in items:
+    rows = []
+    seen = set()
+    for item in _items(result, "recommendations"):
         name = _name_from_item(item)
-        if not name:
-            continue
         key = _norm(name)
         if not key or key in seen:
             continue
         seen.add(key)
-        rows.append({
-            "name": name,
-            "phone": None,   # rule: Qloo never supplies a phone number
-            "area": str((item or {}).get("neighbourhood") or (item or {}).get("area") or "").strip()[:40],
-            "cuisine": str((item or {}).get("cuisine") or "").strip()[:60],
-            "why": str((item or {}).get("why_relevant") or (item or {}).get("reason") or "").strip()[:160],
-            "source": source,
-        })
+        detail = item if isinstance(item, dict) else {}
+        rows.append({"name": name, "phone": None,
+                     "area": str(detail.get("neighbourhood") or detail.get("area") or "")[:40],
+                     "cuisine": str(detail.get("cuisine") or "")[:60],
+                     "why": str(detail.get("why_relevant") or detail.get("reason") or "")[:160],
+                     "qloo_entity_id": detail.get("entity_id"), "source": source})
     return rows
 
 
-def _names_from_rank_result(result) -> list[str]:
-    """Extract an ordered list of restaurant names from a qloo_rank response."""
-    items: list = []
-    if isinstance(result, list):
-        items = result
-    elif isinstance(result, dict):
-        items = result.get("ranked") or result.get("results") or result.get("options") or []
-
-    names: list[str] = []
-    for item in items:
-        name = _name_from_item(item)
-        if name and name not in names:
-            names.append(name)
-    return names
-
-
-def _districts_from_result(result) -> list[str]:
-    """Extract district names from a qloo_where_popular response."""
-    items: list = []
-    if isinstance(result, list):
-        items = result
-    elif isinstance(result, dict):
-        items = result.get("locations") or result.get("districts") or result.get("results") or []
-
-    districts: list[str] = []
-    for item in items:
-        if isinstance(item, str) and item.strip():
-            districts.append(item.strip())
-        elif isinstance(item, dict):
-            name = str(item.get("district") or item.get("location") or item.get("name") or "").strip()
-            if name:
-                districts.append(name)
-    return districts
-
-
-def _name_from_item(item) -> str:
-    """Extract a restaurant name from whatever shape Qloo returns."""
-    if isinstance(item, str):
-        return item.strip()
-    if isinstance(item, dict):
-        return str(
-            item.get("restaurant_name") or item.get("name") or item.get("entity") or ""
-        ).strip()[:80]
-    return ""
-
-
-# ---------------------------------------------------------------------------
-# Merge (same contract as exa_search.merge)
-# ---------------------------------------------------------------------------
-
 def merge(osm_rows: list[dict], qloo_rows: list[dict]) -> list[dict]:
-    """Merge Qloo names into OSM rows, by normalised name.
-
-    OSM rows are the spine (they carry phone numbers). A Qloo row that matches
-    an OSM row only ever adds description. A Qloo row with no OSM match is
-    appended with phone=None.
-
-    This is identical in contract to exa_search.merge so callers can treat
-    both interchangeably.
-    """
+    """Join exact normalized names; never infer a phone via a fuzzy branch match."""
     merged = [dict(row) for row in osm_rows]
-    index = {_norm(row.get("name", "")): row for row in merged}
-
     for row in qloo_rows:
         key = _norm(row.get("name", ""))
         if not key:
             continue
-        held = index.get(key)
-        if held is None:
-            held = next(
-                (v for k, v in index.items() if len(key) > 4 and (key in k or k in key)),
-                None,
-            )
-
-        if held is not None:
-            if not held.get("cuisine") and row.get("cuisine"):
-                held["cuisine"] = row["cuisine"]
-            if not held.get("area") and row.get("area"):
-                held["area"] = row["area"]
-            if row.get("why") and not held.get("why"):
-                held["why"] = row["why"]
-            held["also_found_by"] = "qloo"
+        matches = [held for held in merged if _norm(held.get("name", "")) == key]
+        if matches:
+            for held in matches:
+                for field in ("cuisine", "area", "why", "qloo_entity_id"):
+                    if not held.get(field) and row.get(field):
+                        held[field] = row[field]
+                held["also_found_by"] = "qloo"
         else:
-            fresh = dict(row)
-            fresh["phone"] = None  # rule: never from Qloo
-            merged.append(fresh)
-            index[key] = fresh
+            merged.append({**row, "phone": None})
+    return sorted(merged, key=lambda r: (bool(r.get("phone")), bool(r.get("cuisine"))), reverse=True)
 
-    return sorted(
-        merged,
-        key=lambda r: (bool(r.get("phone")), bool(r.get("cuisine"))),
-        reverse=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
 
 def _norm(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+    return "".join(c for c in unicodedata.normalize("NFKC", text).casefold() if c.isalnum())

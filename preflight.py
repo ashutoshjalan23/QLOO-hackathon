@@ -31,6 +31,7 @@ sys.path.insert(0, str(ROOT))
 
 import pipeline
 import places
+import qloo_search
 import vapi_calls
 from envlite import check_tls, env, env_list, load_env
 
@@ -363,13 +364,24 @@ def check_safety() -> None:
 
 # ---------------------------------------------------------------------------
 
+def check_qloo() -> None:
+    if not qloo_search.harness_available():
+        warn("qloo", "harness unavailable; OSM/Exa fallback will be used",
+             "npm install --global @qloo/qloo-harness@0.1.26")
+    elif not qloo_search.readiness():
+        warn("qloo", "credentials not ready; Qloo recommendations may be unavailable",
+             "qloo setup --qloo; qloo setup --status --json")
+    else:
+        ok("qloo", "harness and credentials configured (live results not probed)")
+
+
 def main() -> int:
     load_env(ROOT / ".env")
     print(f"\n{BOLD}RainCheck preflight{RESET}")
     print(f"{DIM}every dependency, checked live{RESET}\n")
 
     for step in (check_tls_store, check_env_file, check_telegram, check_gemini,
-                 check_exa, check_overpass, check_cache, check_elevenlabs,
+                 check_exa, check_qloo, check_overpass, check_cache, check_elevenlabs,
                  check_bridge, check_vapi, check_safety):
         try:
             step()

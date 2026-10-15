@@ -63,6 +63,9 @@ SUITE_PEOPLE = Path(__file__).resolve().parent / "_test_suite_people.json"
 
 def run() -> Suite:
     s = Suite("bot", expect_at_least=107)
+    # No test may start a real credentialed Qloo subprocess.
+    real_qloo_exec = bot.qloo_search._exec
+    bot.qloo_search._exec = lambda *args: []
     bot.PENDING_PATH = TMP_PENDING
     # notify_bridge_dial makes a real POST to localhost:8080. Stub it, and
     # exercise both branches deliberately further down rather than letting a
@@ -849,6 +852,7 @@ def run() -> Suite:
     people.PEOPLE_PATH = real_people_path
     bot.PEOPLE = {}
     bot.notify_bridge_dial = real_notify
+    bot.qloo_search._exec = real_qloo_exec
     bot.STATE_PATH = real_state_path
     bot.STATE.clear()
     for key in ("DEMO_PHONE", "CONSENTED_NUMBERS", "ALLOW_ANY_NUMBER", "CALL_PROVIDER"):

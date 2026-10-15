@@ -14,6 +14,7 @@ import ast
 import json
 import re
 import sys
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -328,16 +329,20 @@ def run() -> Suite:
     # to 60 before relevance_rank threw away the rows the chat had asked for:
     # measured, 1 of 15 Sha Tin rows survived, which is indistinguishable from
     # "there are no restaurants near Sha Tin".
-    places_src = (ROOT / "places.py").read_text(encoding="utf-8")
-    s.check("search_places can return the whole pool",
-            "limit: int | None = 60" in places_src)
-    s.check("...and every return path honours that",
-            "[:limit]" not in places_src.split("def search_places")[1])
-    s.check("the bot asks for the whole pool",
-            "search_places(areas=wanted_areas, limit=None)" in BOT_SRC)
-    s.check("...and cuts only after ranking",
-            (", constraints\n        )[:60]" in BOT_SRC
-             or ", constraints\n            )[:60]" in BOT_SRC))
+    import bot
+    pool = [{"name": f"Venue {i}", "phone": None} for i in range(75)]
+    with patch.object(bot.places, "search_places", return_value=pool) as search, \
+         patch.object(bot.places, "search_cuisine", return_value=[]), \
+         patch.object(bot.exa_search, "search", return_value=[]), \
+         patch.object(bot.qloo_search, "recommend", return_value=[]), \
+         patch.object(bot.places, "relevance_rank", side_effect=lambda rows, _: rows[::-1]) as geo, \
+         patch.object(bot.qloo_search, "rank", side_effect=lambda rows, _: rows) as taste:
+        got = bot.find_candidates({}, ["sha_tin"])
+    s.eq("the bot asks for the whole pool", search.call_args.kwargs["limit"], None)
+    s.eq("geographic ranking sees every row", len(geo.call_args.args[0]), 75)
+    s.eq("the bot cuts to 60 after ranking", len(got), 60)
+    s.eq("the most relevant late row survives the cut", got[0]["name"], "Venue 74")
+    s.eq("Qloo sees the bounded geographic ranking", taste.call_args.args[0], got)
 
     # --- dialling is a human's job, permanently ---------------------------
     #

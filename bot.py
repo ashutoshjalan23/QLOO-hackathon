@@ -382,6 +382,19 @@ def resolve_dial_target(real_phone: str | None) -> tuple[str | None, bool, str |
 # /decide
 # ===========================================================================
 
+def find_candidates(constraints: dict, wanted_areas: list[str]) -> list[dict]:
+    """Search the whole pool, rank it geographically, then bound Qloo's input."""
+    osm_rows = places.search_places(areas=wanted_areas, limit=None)
+    cuisine_rows = places.search_cuisine(constraints)
+    if cuisine_rows:
+        osm_rows = places.dedupe_and_rank(osm_rows + cuisine_rows)
+    exa_rows = exa_search.search(constraints)
+    qloo_rows = qloo_search.recommend(constraints)
+    combined = qloo_search.merge(exa_search.merge(osm_rows, exa_rows), qloo_rows)
+    geo_ranked = places.relevance_rank(combined, constraints)[:60]
+    return qloo_search.rank(geo_ranked, constraints)
+
+
 def handle_decide(tg: Telegram, chat_id: int, state: ChatState) -> None:
     state.awaiting = None
     state.pending_winner = None
@@ -459,19 +472,6 @@ def handle_decide(tg: Telegram, chat_id: int, state: ChatState) -> None:
                     )
                     known_origins.add(area.lower())
 
-        # Remembered origins count too. Dan said he commutes from Sha Tin
-        # three weeks ago; he should not have to repeat it for the search to
-        # take it into account. This is the memory paying off in the SEARCH,
-        # not only in the constraint list.
-        seen_origins = {str((e or {}).get("place") or "").strip().lower()
-                        for e in (constraints.get("coming_from") or [])}
-        for person in people.people_in(PEOPLE.get(str(chat_id)) or {}):
-            for area in person.get("areas") or []:
-                if area and area.lower() not in seen_origins:
-                    constraints.setdefault("coming_from", []).append(
-                        {"who": person.get("name", ""), "place": area, "from_memory": True})
-                    seen_origins.add(area.lower())
-
         wanted_areas = places.areas_for(constraints)
         if state.demo_mode:
             # The stage demo must be instant and repeatable. These are the
@@ -484,17 +484,7 @@ def handle_decide(tg: Telegram, chat_id: int, state: ChatState) -> None:
             # is territory-wide and constraint-blind, so a 60-row cut taken before
             # relevance_rank left 1 of 15 Sha Tin rows alive -- indistinguishable
             # from "there are no restaurants near Sha Tin".
-            osm_rows = places.search_places(areas=wanted_areas, limit=None)
-            # The area pool can miss a cuisine almost entirely; add a
-            # territory-wide search for whatever the group is craving.
-            cuisine_rows = places.search_cuisine(constraints)
-            if cuisine_rows:
-                osm_rows = places.dedupe_and_rank(osm_rows + cuisine_rows)
-            exa_rows = exa_search.search(constraints)
-            qloo_rows = qloo_search.recommend(constraints)
-            combined_rows = qloo_search.merge(exa_search.merge(osm_rows, exa_rows), qloo_rows)
-            geo_ranked = places.relevance_rank(combined_rows, constraints)[:60]
-            candidates = qloo_search.rank(geo_ranked, constraints)
+            candidates = find_candidates(constraints, wanted_areas)
         origins = places.origin_districts(constraints)
         destinations = places.destination_districts(constraints)
         fair = places.meeting_districts(origins)[:3] if origins and not destinations else []
