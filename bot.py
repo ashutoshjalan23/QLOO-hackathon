@@ -39,6 +39,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import exa_search
+import qloo_search
 import invite
 import people
 import places
@@ -490,9 +491,10 @@ def handle_decide(tg: Telegram, chat_id: int, state: ChatState) -> None:
             if cuisine_rows:
                 osm_rows = places.dedupe_and_rank(osm_rows + cuisine_rows)
             exa_rows = exa_search.search(constraints)
-            candidates = places.relevance_rank(
-                exa_search.merge(osm_rows, exa_rows), constraints
-            )[:60]
+            qloo_rows = qloo_search.recommend(constraints)
+            combined_rows = qloo_search.merge(exa_search.merge(osm_rows, exa_rows), qloo_rows)
+            geo_ranked = places.relevance_rank(combined_rows, constraints)[:60]
+            candidates = qloo_search.rank(geo_ranked, constraints)
         origins = places.origin_districts(constraints)
         destinations = places.destination_districts(constraints)
         fair = places.meeting_districts(origins)[:3] if origins and not destinations else []
